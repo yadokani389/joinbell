@@ -16,8 +16,8 @@ struct RecruitConfig {
     game_title: String,
     required_players: u64,
     mention_role: RoleId,
-    #[serde(default)]
     notify_on_reaction: bool,
+    auto_assign_role_on_reaction: bool,
 }
 
 #[tokio::main]
@@ -63,12 +63,17 @@ async fn event_handler(
     Ok(())
 }
 
+/// 募集を作成します(mention_roleが未指定の場合はロールを新規作成します)
 #[poise::command(slash_command, guild_only)]
 async fn recruit(
     ctx: poise::Context<'_, (), Error>,
     #[description = "募集するゲーム名"] game_title: String,
     #[description = "開始に必要な人数"] required_players: u64,
-    #[description = "開始時にメンションするロール"] mention_role: serenity::Role,
+    #[description = "開始時にメンションするロール(未指定なら作成)"] mention_role: Option<
+        serenity::Role,
+    >,
+    #[description = "リアクション追加時にロールを自動付与するかどうか"]
+    auto_assign_role_on_reaction: Option<bool>,
     #[description = "リアクション追加時に参加通知を送るかどうか"] notify_on_reaction: Option<bool>,
 ) -> Result<(), Error> {
     if required_players == 0 {
@@ -77,9 +82,37 @@ async fn recruit(
         return Ok(());
     }
 
-    let notify_on_reaction = notify_on_reaction.unwrap_or(false);
+    let mention_role_id = match mention_role {
+        Some(ref role) => role.id,
+        None => {
+            let guild_id = match ctx.guild_id() {
+                Some(guild_id) => guild_id,
+                None => {
+                    ctx.send(
+                        CreateReply::default()
+                            .content("サーバー内でのみロールを作成できます。")
+                            .ephemeral(true),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let role = guild_id
+                .create_role(
+                    ctx,
+                    serenity::builder::EditRole::new()
+                        .name(&game_title)
+                        .mentionable(true),
+                )
+                .await?;
+            role.id
+        }
+    };
 
-    let role_mention = mention_role.id;
+    let notify_on_reaction = notify_on_reaction.unwrap_or(false);
+    let auto_assign_role_on_reaction =
+        auto_assign_role_on_reaction.unwrap_or(mention_role.is_none());
+
     let message_body = format!(
         r#"
 このメッセージに :raised_hand: をつけると {game_title} に参加できます
@@ -87,8 +120,9 @@ async fn recruit(
 ```toml
 game_title = {game_title:?}
 required_players = {required_players}
-mention_role = {role_mention}
+mention_role = {mention_role_id}
 notify_on_reaction = {notify_on_reaction}
+auto_assign_role_on_reaction = {auto_assign_role_on_reaction}
 ```"#,
     );
 
@@ -117,7 +151,7 @@ async fn handle_reaction_add(
         return Ok(());
     }
 
-    let message = reaction.message(ctx.http.clone()).await?;
+    let message = reaction.message(ctx).await?;
     if message.author.id != ctx.cache.current_user().id {
         return Ok(());
     }
@@ -149,6 +183,13 @@ async fn handle_reaction_add(
 
     if config.notify_on_reaction {
         send_participation_notification(ctx, &config, reaction).await?;
+    }
+
+    if config.auto_assign_role_on_reaction
+        && let Err(err) = assign_role_if_missing(ctx, reaction, config.mention_role).await
+    {
+        eprintln!("Failed to assign role: {err}");
+        send_role_assign_error(ctx, reaction).await?;
     }
 
     if current_count == config.required_players {
@@ -196,7 +237,7 @@ async fn send_error_message(
         Some(user_id) => format!("{} {}", user_id.mention(), ERROR_MESSAGE),
         None => ERROR_MESSAGE.to_string(),
     };
-    channel_id.say(ctx.http.clone(), content).await?;
+    channel_id.say(ctx, content).await?;
     Ok(())
 }
 
@@ -215,7 +256,7 @@ async fn send_participation_notification(
         user_id.mention(),
         config.game_title
     );
-    let message = channel_id.say(ctx.http.clone(), content).await?;
+    let message = channel_id.say(ctx, content).await?;
 
     schedule_delete_message(ctx.http.clone(), channel_id, message.id);
     Ok(())
@@ -242,11 +283,44 @@ async fn send_start_notification(
         config.game_title
     );
     let channel_id = message.channel_id;
-    let start_message = channel_id.say(ctx.http.clone(), content).await?;
+    let start_message = channel_id.say(ctx, content).await?;
 
     schedule_delete_message(ctx.http.clone(), channel_id, start_message.id);
     schedule_delete_reaction(ctx.http.clone(), channel_id, message.id, reaction_type);
 
+    Ok(())
+}
+
+async fn assign_role_if_missing(
+    ctx: &serenity::Context,
+    reaction: &serenity::Reaction,
+    role_id: serenity::RoleId,
+) -> Result<(), Error> {
+    let Some(user_id) = reaction.user_id else {
+        return Ok(());
+    };
+    let Some(guild_id) = reaction.guild_id else {
+        return Ok(());
+    };
+    let member = guild_id.member(ctx, user_id).await?;
+    if member.roles.contains(&role_id) {
+        return Ok(());
+    }
+    member.add_role(ctx, role_id).await?;
+    Ok(())
+}
+
+async fn send_role_assign_error(
+    ctx: &serenity::Context,
+    reaction: &serenity::Reaction,
+) -> Result<(), Error> {
+    let channel_id = reaction.channel_id;
+    const ERROR_MESSAGE: &str = "ロールの付与に失敗しました。権限を確認してください。";
+    let content = match reaction.user_id {
+        Some(user_id) => format!("{} {}", user_id.mention(), ERROR_MESSAGE),
+        None => ERROR_MESSAGE.to_string(),
+    };
+    channel_id.say(ctx, content).await?;
     Ok(())
 }
 
@@ -260,7 +334,7 @@ async fn fetch_reaction_users(
 
     loop {
         let chunk = message
-            .reaction_users(ctx.http.clone(), reaction_type.clone(), Some(100), after)
+            .reaction_users(ctx, reaction_type.clone(), Some(100), after)
             .await?;
         if chunk.is_empty() {
             break;

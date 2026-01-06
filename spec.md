@@ -17,6 +17,8 @@
 - ユーザーはスラッシュコマンドを実行することで募集を作成する
 - コマンド実行後, Bot は指定されたチャンネルに募集メッセージを投稿する
 - Bot は募集メッセージに参加用のリアクションを自動で付与する
+- `mention_role` が未指定の場合, Bot は `{game_title}` の名前でロールを作成し,
+  開始通知で使用するロールとして設定する（mentionable = true）
 
 ### 2.2 募集メッセージ
 
@@ -37,6 +39,7 @@ game_title = "minecraft"
 required_players = 3
 mention_role = 12345
 notify_on_reaction = true
+auto_assign_role_on_reaction = true
 ```
 ````
 
@@ -58,12 +61,18 @@ notify_on_reaction = true
   開始時にメンションするロール
 - `notify_on_reaction`
   リアクション追加時に参加通知メッセージを送信するかどうか
+- `auto_assign_role_on_reaction`
+  リアクション追加時に, `mention_role` を自動で付与するかどうか
+  （`mention_role` 未指定で作成した場合のデフォルトは true）
 
 ## 4. 参加方法
 
 - ユーザーは募集メッセージに付与された参加用リアクションを付けることで参加する
 - リアクションを外すことで参加を取り消すことができる
 - 参加者の管理はリアクションの状態を正とし, Bot は参加者リストを保持しない
+- `auto_assign_role_on_reaction = true` の場合, リアクション追加時に
+  `mention_role` を持っていなければ自動で付与する
+- リアクションを外しても, 自動付与されたロールは外さない
 
 ## 5. 参加通知（任意機能）
 
