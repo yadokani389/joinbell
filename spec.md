@@ -35,7 +35,7 @@
 ```toml
 game_title = "minecraft"
 required_players = 3
-mention_role = <@12345>
+mention_role = 12345
 notify_on_reaction = true
 ```
 ````

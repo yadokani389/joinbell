@@ -4,3 +4,8 @@ name = "joinbell"
 version = "0.1.0"
 
 [dependencies]
+dotenvy = "0.15.7"
+poise = "0.6.1"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["full"] }
+toml = "0.9.10"
