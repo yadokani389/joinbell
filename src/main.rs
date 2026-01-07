@@ -286,7 +286,13 @@ async fn send_start_notification(
     let start_message = channel_id.say(ctx, content).await?;
 
     schedule_delete_message(ctx.http.clone(), channel_id, start_message.id);
-    schedule_delete_reaction(ctx.http.clone(), channel_id, message.id, reaction_type);
+
+    channel_id
+        .delete_reaction_emoji(ctx, message.id, reaction_type)
+        .await?;
+    channel_id
+        .create_reaction(ctx, message.id, participation_reaction_type())
+        .await?;
 
     Ok(())
 }
@@ -358,22 +364,5 @@ fn schedule_delete_message(
     tokio::spawn(async move {
         sleep(Duration::from_secs(DELETE_DELAY_SECONDS)).await;
         let _ = channel_id.delete_message(&http, message_id).await;
-    });
-}
-
-fn schedule_delete_reaction(
-    http: std::sync::Arc<serenity::Http>,
-    channel_id: serenity::ChannelId,
-    recruit_message_id: serenity::MessageId,
-    reaction_type: serenity::ReactionType,
-) {
-    tokio::spawn(async move {
-        sleep(Duration::from_secs(DELETE_DELAY_SECONDS)).await;
-        let _ = channel_id
-            .delete_reaction_emoji(&http, recruit_message_id, reaction_type)
-            .await;
-        let _ = channel_id
-            .create_reaction(&http, recruit_message_id, participation_reaction_type())
-            .await;
     });
 }
