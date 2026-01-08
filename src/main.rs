@@ -9,6 +9,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 const DELETE_DELAY_SECONDS: u64 = 3600;
 const PARTICIPATION_EMOJI: &str = "✋";
 const SILENT_PARTICIPATION_EMOJI: &str = "🤚";
+const START_EMOJI: &str = "🔔";
 
 #[derive(Debug, Deserialize)]
 struct RecruitConfig {
@@ -110,10 +111,12 @@ async fn recruit(
     let auto_assign_role_on_reaction =
         auto_assign_role_on_reaction.unwrap_or(create_role) && mention_role_id.is_some();
 
-    let mut reaction_line = format!("{PARTICIPATION_EMOJI}: 参加");
+    let mut reaction_lines = vec![format!("{PARTICIPATION_EMOJI}: 参加")];
     if notify_on_reaction {
-        reaction_line += &format!("\n{SILENT_PARTICIPATION_EMOJI}: 参加通知なしで参加");
+        reaction_lines.push(format!("{SILENT_PARTICIPATION_EMOJI}: 参加通知なしで参加"));
     }
+    reaction_lines.push(format!("{START_EMOJI}: 人数が揃っていなくても開始"));
+    let reaction_line = reaction_lines.join("\n");
 
     let mut config_lines = Vec::new();
     config_lines.push(format!("game_title = {game_title:?}"));
@@ -135,7 +138,6 @@ async fn recruit(
         r#"
 このメッセージにリアクションをつけると {game_title} に参加できます
 {reaction_line}
-人数が揃ったら開始通知が送られます
 ```toml
 {config_block}
 ```"#,
@@ -150,6 +152,7 @@ async fn recruit(
             .react(ctx.http(), silent_participation_reaction_type())
             .await?;
     }
+    message.react(ctx.http(), start_reaction_type()).await?;
 
     ctx.send(
         CreateReply::default()
@@ -208,8 +211,9 @@ async fn handle_reaction_add(ctx: &Context, reaction: &Reaction) -> Result<(), E
     user_ids.extend(fetch_reaction_users(ctx, &message, participation_reaction_type()).await?);
     user_ids
         .extend(fetch_reaction_users(ctx, &message, silent_participation_reaction_type()).await?);
+    user_ids.extend(fetch_reaction_users(ctx, &message, start_reaction_type()).await?);
 
-    if config.required_players <= user_ids.len() {
+    if is_start_reaction(&reaction.emoji) || config.required_players <= user_ids.len() {
         send_start_notification(ctx, &config, &message, config.mention_role, user_ids).await?;
     }
 
@@ -224,6 +228,10 @@ fn silent_participation_reaction_type() -> ReactionType {
     ReactionType::Unicode(SILENT_PARTICIPATION_EMOJI.to_string())
 }
 
+fn start_reaction_type() -> ReactionType {
+    ReactionType::Unicode(START_EMOJI.to_string())
+}
+
 fn is_participation_reaction(reaction: &ReactionType) -> bool {
     matches!(reaction, ReactionType::Unicode(value) if value == PARTICIPATION_EMOJI)
 }
@@ -232,8 +240,14 @@ fn is_silent_participation_reaction(reaction: &ReactionType) -> bool {
     matches!(reaction, ReactionType::Unicode(value) if value == SILENT_PARTICIPATION_EMOJI)
 }
 
+fn is_start_reaction(reaction: &ReactionType) -> bool {
+    matches!(reaction, ReactionType::Unicode(value) if value == START_EMOJI)
+}
+
 fn is_supported_participation_reaction(reaction: &ReactionType) -> bool {
-    is_participation_reaction(reaction) || is_silent_participation_reaction(reaction)
+    is_participation_reaction(reaction)
+        || is_silent_participation_reaction(reaction)
+        || is_start_reaction(reaction)
 }
 
 fn parse_recruit_config(content: &str) -> Result<RecruitConfig, String> {
@@ -309,14 +323,7 @@ async fn send_start_notification(
 
     schedule_delete_message(ctx.http.clone(), channel_id, start_message.id);
 
-    channel_id
-        .delete_reaction_emoji(ctx, message.id, participation_reaction_type())
-        .await?;
-    if config.notify_on_reaction {
-        channel_id
-            .delete_reaction_emoji(ctx, message.id, silent_participation_reaction_type())
-            .await?;
-    }
+    channel_id.delete_reactions(ctx, message.id).await?;
     channel_id
         .create_reaction(ctx, message.id, participation_reaction_type())
         .await?;
@@ -325,6 +332,9 @@ async fn send_start_notification(
             .create_reaction(ctx, message.id, silent_participation_reaction_type())
             .await?;
     }
+    channel_id
+        .create_reaction(ctx, message.id, start_reaction_type())
+        .await?;
 
     Ok(())
 }
