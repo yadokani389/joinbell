@@ -36,7 +36,7 @@
 例
 
 ````text
-このメッセージにリアクションをつけると {game} に参加できます
+このメッセージにリアクションをつけると {game_title} に参加できます
 :raised_hand: で参加
 :raised_back_of_hand: で参加通知なしで参加
 人数が揃ったら, または :bell: で開始通知が送られます
@@ -47,6 +47,7 @@ required_players = 3
 mention_role = 12345
 notify_on_reaction = true
 auto_assign_role_on_reaction = true
+delete_after_minutes = 60
 ```
 ````
 
@@ -72,6 +73,9 @@ auto_assign_role_on_reaction = true
 - `auto_assign_role_on_reaction`
   リアクション追加時に, `mention_role` を自動で付与するかどうか
   (`create_role = true` で自動作成した場合のデフォルトは true)
+- `delete_after_minutes`
+  参加通知/開始通知メッセージを削除するまでの分数
+  (1 以上, 未指定の場合は 60)
 
 ## 4. 参加方法
 
@@ -82,7 +86,6 @@ auto_assign_role_on_reaction = true
   参加通知を送らずに参加できる
 - リアクションを外すことで参加を取り消すことができる
 - 参加者の管理はリアクションの状態を正とし, Bot は参加者リストを保持しない
-- 参加人数は `:raised_hand:` と `:raised_back_of_hand:` を付けたユーザーの
 - 参加人数は `:raised_hand:` と `:raised_back_of_hand:` と `:bell:` を付けたユーザーの
   ユニーク数とする
 - `:bell:` は参加意思の表明と同時に, 人数が揃っていなくても開始するためのリアクションとする
@@ -106,13 +109,13 @@ auto_assign_role_on_reaction = true
 例
 
 ```text
-{user} が {game} に参加しました
+{user} が {game_title} に参加しました
 ```
 
 ### 5.3 削除仕様
 
 - 参加通知メッセージは送信時点で削除タスクを登録する
-- 送信から 1 時間後に自動で削除される
+- 送信から `delete_after_minutes` 分後に自動で削除される
 - リアクションが後から削除されても, 送信済みの参加通知は削除されない
 
 ## 6. 開始条件
@@ -140,19 +143,19 @@ auto_assign_role_on_reaction = true
 
 ```text
 @role
-@user1 @user2 が {game} を開始します
+@user1 @user2 が {game_title} を開始します
 ```
 
 ### 8.2 削除仕様
 
 - 開始通知メッセージは送信時点で削除タスクを登録する
-- 送信から 1 時間後に自動で削除される
+- 送信から `delete_after_minutes` 分後に自動で削除される
 
 ## 9. 開始後の処理
 
 - 開始通知メッセージ送信の直後に募集メッセージに付与された参加用リアクションを削除し, 再付与する
 - 継続参加する場合は再付与後に改めてリアクションを付ける必要がある
-- 開始通知メッセージは送信から 1 時間後に削除される
+- 開始通知メッセージは送信から `delete_after_minutes` 分後に削除される
 - 募集メッセージ自体は削除しない
 
 ## 10. 同時募集

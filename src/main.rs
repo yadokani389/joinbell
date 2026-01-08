@@ -6,7 +6,7 @@ use tokio::time::{Duration, sleep};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-const DELETE_DELAY_SECONDS: u64 = 3600;
+const DEFAULT_DELETE_AFTER_MINUTES: u64 = 60;
 const PARTICIPATION_EMOJI: &str = "✋";
 const SILENT_PARTICIPATION_EMOJI: &str = "🤚";
 const START_EMOJI: &str = "🔔";
@@ -20,6 +20,8 @@ struct RecruitConfig {
     notify_on_reaction: bool,
     #[serde(default)]
     auto_assign_role_on_reaction: bool,
+    #[serde(default = "default_delete_after_minutes")]
+    delete_after_minutes: u64,
 }
 
 #[tokio::main]
@@ -76,11 +78,19 @@ async fn recruit(
     #[description = "リアクション追加時にロールを自動付与するかどうか"]
     auto_assign_role_on_reaction: Option<bool>,
     #[description = "リアクション追加時に参加通知を送るかどうか"] notify_on_reaction: Option<bool>,
+    #[description = "通知メッセージを削除するまでの分数"] delete_after_minutes: Option<u64>,
 ) -> Result<(), Error> {
     if required_players == 0 {
         ctx.say("required_players は 1 以上を指定してください。")
             .await?;
         return Ok(());
+    }
+    if let Some(delete_after_minutes_value) = delete_after_minutes {
+        if delete_after_minutes_value == 0 {
+            ctx.say("delete_after_minutes は 1 以上を指定してください。")
+                .await?;
+            return Ok(());
+        }
     }
 
     let create_role = create_role.unwrap_or(false);
@@ -131,6 +141,9 @@ async fn recruit(
         config_lines.push(format!(
             "auto_assign_role_on_reaction = {auto_assign_role_on_reaction}"
         ));
+    }
+    if let Some(delete_after_minutes) = delete_after_minutes {
+        config_lines.push(format!("delete_after_minutes = {delete_after_minutes}"));
     }
     let config_block = config_lines.join("\n");
 
@@ -191,6 +204,10 @@ async fn handle_reaction_add(ctx: &Context, reaction: &Reaction) -> Result<(), E
     };
 
     if config.required_players == 0 {
+        send_error_message(ctx, reaction).await?;
+        return Ok(());
+    }
+    if config.delete_after_minutes == 0 {
         send_error_message(ctx, reaction).await?;
         return Ok(());
     }
@@ -259,6 +276,10 @@ fn default_notify_on_reaction() -> bool {
     true
 }
 
+fn default_delete_after_minutes() -> u64 {
+    DEFAULT_DELETE_AFTER_MINUTES
+}
+
 fn extract_toml_block(content: &str) -> Option<&str> {
     let start_index = content.find("```toml")?;
     let rest = &content[start_index + "```toml".len()..];
@@ -294,7 +315,12 @@ async fn send_participation_notification(
     );
     let message = channel_id.say(ctx, content).await?;
 
-    schedule_delete_message(ctx.http.clone(), channel_id, message.id);
+    schedule_delete_message(
+        ctx.http.clone(),
+        channel_id,
+        message.id,
+        config.delete_after_minutes,
+    );
     Ok(())
 }
 
@@ -321,7 +347,12 @@ async fn send_start_notification(
     let channel_id = message.channel_id;
     let start_message = channel_id.say(ctx, content).await?;
 
-    schedule_delete_message(ctx.http.clone(), channel_id, start_message.id);
+    schedule_delete_message(
+        ctx.http.clone(),
+        channel_id,
+        start_message.id,
+        config.delete_after_minutes,
+    );
 
     channel_id.delete_reactions(ctx, message.id).await?;
     channel_id
@@ -403,9 +434,11 @@ fn schedule_delete_message(
     http: std::sync::Arc<Http>,
     channel_id: ChannelId,
     message_id: MessageId,
+    delete_after_minutes: u64,
 ) {
+    let delete_after_seconds = delete_after_minutes.saturating_mul(60);
     tokio::spawn(async move {
-        sleep(Duration::from_secs(DELETE_DELAY_SECONDS)).await;
+        sleep(Duration::from_secs(delete_after_seconds)).await;
         let _ = channel_id.delete_message(&http, message_id).await;
     });
 }
