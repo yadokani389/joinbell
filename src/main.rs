@@ -15,8 +15,10 @@ const PARTICIPATION_EMOJI: &str = "✋";
 struct RecruitConfig {
     game_title: String,
     required_players: u64,
-    mention_role: RoleId,
+    mention_role: Option<RoleId>,
+    #[serde(default = "default_notify_on_reaction")]
     notify_on_reaction: bool,
+    #[serde(default)]
     auto_assign_role_on_reaction: bool,
 }
 
@@ -63,15 +65,14 @@ async fn event_handler(
     Ok(())
 }
 
-/// 募集を作成します(mention_roleが未指定の場合はロールを新規作成します)
+/// 募集を作成します
 #[poise::command(slash_command, guild_only)]
 async fn recruit(
     ctx: poise::Context<'_, (), Error>,
     #[description = "募集するゲーム名"] game_title: String,
     #[description = "開始に必要な人数"] required_players: u64,
-    #[description = "開始時にメンションするロール(未指定なら作成)"] mention_role: Option<
-        serenity::Role,
-    >,
+    #[description = "開始時にメンションするロール"] mention_role: Option<serenity::Role>,
+    #[description = "ロールを作成するかどうか"] create_role: Option<bool>,
     #[description = "リアクション追加時にロールを自動付与するかどうか"]
     auto_assign_role_on_reaction: Option<bool>,
     #[description = "リアクション追加時に参加通知を送るかどうか"] notify_on_reaction: Option<bool>,
@@ -82,9 +83,10 @@ async fn recruit(
         return Ok(());
     }
 
+    let create_role = create_role.unwrap_or(false);
     let mention_role_id = match mention_role {
-        Some(ref role) => role.id,
-        None => {
+        Some(ref role) => Some(role.id),
+        None if create_role => {
             let guild_id = match ctx.guild_id() {
                 Some(guild_id) => guild_id,
                 None => {
@@ -105,24 +107,37 @@ async fn recruit(
                         .mentionable(true),
                 )
                 .await?;
-            role.id
+            Some(role.id)
         }
+        None => None,
     };
 
-    let notify_on_reaction = notify_on_reaction.unwrap_or(false);
+    let notify_on_reaction = notify_on_reaction.unwrap_or(true);
     let auto_assign_role_on_reaction =
-        auto_assign_role_on_reaction.unwrap_or(mention_role.is_none());
+        auto_assign_role_on_reaction.unwrap_or(create_role) && mention_role_id.is_some();
+
+    let mut config_lines = Vec::new();
+    config_lines.push(format!("game_title = {game_title:?}"));
+    config_lines.push(format!("required_players = {required_players}"));
+    if let Some(role_id) = mention_role_id {
+        config_lines.push(format!("mention_role = {role_id}"));
+    }
+    if !notify_on_reaction {
+        config_lines.push(format!("notify_on_reaction = {notify_on_reaction}"));
+    }
+    if auto_assign_role_on_reaction {
+        config_lines.push(format!(
+            "auto_assign_role_on_reaction = {auto_assign_role_on_reaction}"
+        ));
+    }
+    let config_block = config_lines.join("\n");
 
     let message_body = format!(
         r#"
 このメッセージに :raised_hand: をつけると {game_title} に参加できます
 人数が揃ったら開始通知が送られます
 ```toml
-game_title = {game_title:?}
-required_players = {required_players}
-mention_role = {mention_role_id}
-notify_on_reaction = {notify_on_reaction}
-auto_assign_role_on_reaction = {auto_assign_role_on_reaction}
+{config_block}
 ```"#,
     );
 
@@ -186,13 +201,14 @@ async fn handle_reaction_add(
     }
 
     if config.auto_assign_role_on_reaction
-        && let Err(err) = assign_role_if_missing(ctx, reaction, config.mention_role).await
+        && let Some(role_id) = config.mention_role
+        && let Err(err) = assign_role_if_missing(ctx, reaction, role_id).await
     {
         eprintln!("Failed to assign role: {err}");
         send_role_assign_error(ctx, reaction).await?;
     }
 
-    if current_count == config.required_players {
+    if config.required_players <= current_count {
         send_start_notification(
             ctx,
             &config,
@@ -219,6 +235,10 @@ fn parse_recruit_config(content: &str) -> Result<RecruitConfig, String> {
     toml::from_str(block).map_err(|err| err.to_string())
 }
 
+fn default_notify_on_reaction() -> bool {
+    true
+}
+
 fn extract_toml_block(content: &str) -> Option<&str> {
     let start_index = content.find("```toml")?;
     let rest = &content[start_index + "```toml".len()..];
@@ -231,12 +251,11 @@ async fn send_error_message(
     reaction: &serenity::Reaction,
 ) -> Result<(), Error> {
     let channel_id = reaction.channel_id;
-    const ERROR_MESSAGE: &str =
-        "募集設定の読み取りに失敗しました。募集メッセージを作り直してください。";
-    let content = match reaction.user_id {
-        Some(user_id) => format!("{} {}", user_id.mention(), ERROR_MESSAGE),
-        None => ERROR_MESSAGE.to_string(),
-    };
+    let content = reaction
+        .user_id
+        .map(|uid| uid.mention().to_string())
+        .unwrap_or_default()
+        + "募集設定の読み取りに失敗しました。募集メッセージを作り直してください。";
     channel_id.say(ctx, content).await?;
     Ok(())
 }
@@ -266,7 +285,7 @@ async fn send_start_notification(
     ctx: &serenity::Context,
     config: &RecruitConfig,
     message: &serenity::Message,
-    role_id: serenity::RoleId,
+    role_id: Option<serenity::RoleId>,
     reaction_type: serenity::ReactionType,
 ) -> Result<(), Error> {
     let users = fetch_reaction_users(ctx, message, reaction_type.clone()).await?;
@@ -276,12 +295,14 @@ async fn send_start_notification(
         .map(|user| user.mention().to_string())
         .collect();
 
-    let content = format!(
-        "{}\n{} が {} を開始します",
-        role_id.mention(),
-        mentions.join(" "),
-        config.game_title
-    );
+    let content = role_id
+        .map(|rid| rid.mention().to_string() + "\n")
+        .unwrap_or_default()
+        + &format!(
+            "{} が {} を開始します",
+            mentions.join(" "),
+            config.game_title
+        );
     let channel_id = message.channel_id;
     let start_message = channel_id.say(ctx, content).await?;
 
