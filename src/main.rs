@@ -1,20 +1,19 @@
-use poise::{
-    CreateReply,
-    serenity_prelude::{self as serenity, RoleId},
-};
+use std::collections::HashSet;
+
+use poise::{CreateReply, serenity_prelude::*};
 use serde::Deserialize;
-use serenity::Mentionable;
 use tokio::time::{Duration, sleep};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const DELETE_DELAY_SECONDS: u64 = 3600;
 const PARTICIPATION_EMOJI: &str = "✋";
+const SILENT_PARTICIPATION_EMOJI: &str = "🤚";
 
 #[derive(Debug, Deserialize)]
 struct RecruitConfig {
     game_title: String,
-    required_players: u64,
+    required_players: usize,
     mention_role: Option<RoleId>,
     #[serde(default = "default_notify_on_reaction")]
     notify_on_reaction: bool,
@@ -27,7 +26,7 @@ async fn main() -> Result<(), Error> {
     dotenvy::dotenv().ok();
     let token = std::env::var("DISCORD_TOKEN").expect("Missing DISCORD_TOKEN");
 
-    let intents = serenity::GatewayIntents::non_privileged();
+    let intents = GatewayIntents::non_privileged();
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -45,7 +44,7 @@ async fn main() -> Result<(), Error> {
         })
         .build();
 
-    let mut client = serenity::ClientBuilder::new(token, intents)
+    let mut client = ClientBuilder::new(token, intents)
         .framework(framework)
         .await?;
 
@@ -54,12 +53,12 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn event_handler(
-    ctx: &serenity::Context,
-    event: &serenity::FullEvent,
+    ctx: &Context,
+    event: &FullEvent,
     _framework: poise::FrameworkContext<'_, (), Error>,
     _data: &(),
 ) -> Result<(), Error> {
-    if let serenity::FullEvent::ReactionAdd { add_reaction } = event {
+    if let FullEvent::ReactionAdd { add_reaction } = event {
         handle_reaction_add(ctx, add_reaction).await?;
     }
     Ok(())
@@ -70,8 +69,8 @@ async fn event_handler(
 async fn recruit(
     ctx: poise::Context<'_, (), Error>,
     #[description = "募集するゲーム名"] game_title: String,
-    #[description = "開始に必要な人数"] required_players: u64,
-    #[description = "開始時にメンションするロール"] mention_role: Option<serenity::Role>,
+    #[description = "開始に必要な人数"] required_players: usize,
+    #[description = "開始時にメンションするロール"] mention_role: Option<Role>,
     #[description = "ロールを作成するかどうか"] create_role: Option<bool>,
     #[description = "リアクション追加時にロールを自動付与するかどうか"]
     auto_assign_role_on_reaction: Option<bool>,
@@ -100,12 +99,7 @@ async fn recruit(
                 }
             };
             let role = guild_id
-                .create_role(
-                    ctx,
-                    serenity::builder::EditRole::new()
-                        .name(&game_title)
-                        .mentionable(true),
-                )
+                .create_role(ctx, EditRole::new().name(&game_title).mentionable(true))
                 .await?;
             Some(role.id)
         }
@@ -115,6 +109,11 @@ async fn recruit(
     let notify_on_reaction = notify_on_reaction.unwrap_or(true);
     let auto_assign_role_on_reaction =
         auto_assign_role_on_reaction.unwrap_or(create_role) && mention_role_id.is_some();
+
+    let mut reaction_line = format!("{PARTICIPATION_EMOJI}: 参加");
+    if notify_on_reaction {
+        reaction_line += &format!("\n{SILENT_PARTICIPATION_EMOJI}: 参加通知なしで参加");
+    }
 
     let mut config_lines = Vec::new();
     config_lines.push(format!("game_title = {game_title:?}"));
@@ -134,7 +133,8 @@ async fn recruit(
 
     let message_body = format!(
         r#"
-このメッセージに :raised_hand: をつけると {game_title} に参加できます
+このメッセージにリアクションをつけると {game_title} に参加できます
+{reaction_line}
 人数が揃ったら開始通知が送られます
 ```toml
 {config_block}
@@ -142,8 +142,14 @@ async fn recruit(
     );
 
     let message = ctx.channel_id().say(ctx.http(), message_body).await?;
-    let reaction_type = participation_reaction_type();
-    message.react(ctx.http(), reaction_type).await?;
+    message
+        .react(ctx.http(), participation_reaction_type())
+        .await?;
+    if notify_on_reaction {
+        message
+            .react(ctx.http(), silent_participation_reaction_type())
+            .await?;
+    }
 
     ctx.send(
         CreateReply::default()
@@ -154,11 +160,8 @@ async fn recruit(
     Ok(())
 }
 
-async fn handle_reaction_add(
-    ctx: &serenity::Context,
-    reaction: &serenity::Reaction,
-) -> Result<(), Error> {
-    if !is_participation_reaction(&reaction.emoji) {
+async fn handle_reaction_add(ctx: &Context, reaction: &Reaction) -> Result<(), Error> {
+    if !is_supported_participation_reaction(&reaction.emoji) {
         return Ok(());
     }
 
@@ -189,14 +192,7 @@ async fn handle_reaction_add(
         return Ok(());
     }
 
-    let current_count = message
-        .reactions
-        .iter()
-        .find(|item| item.reaction_type == reaction.emoji)
-        .map(|item| item.count - if item.me { 1 } else { 0 })
-        .unwrap_or(0);
-
-    if config.notify_on_reaction {
+    if config.notify_on_reaction && is_participation_reaction(&reaction.emoji) {
         send_participation_notification(ctx, &config, reaction).await?;
     }
 
@@ -208,26 +204,36 @@ async fn handle_reaction_add(
         send_role_assign_error(ctx, reaction).await?;
     }
 
-    if config.required_players <= current_count {
-        send_start_notification(
-            ctx,
-            &config,
-            &message,
-            config.mention_role,
-            reaction.emoji.clone(),
-        )
-        .await?;
+    let mut user_ids = HashSet::new();
+    user_ids.extend(fetch_reaction_users(ctx, &message, participation_reaction_type()).await?);
+    user_ids
+        .extend(fetch_reaction_users(ctx, &message, silent_participation_reaction_type()).await?);
+
+    if config.required_players <= user_ids.len() {
+        send_start_notification(ctx, &config, &message, config.mention_role, user_ids).await?;
     }
 
     Ok(())
 }
 
-fn participation_reaction_type() -> serenity::ReactionType {
-    serenity::ReactionType::Unicode(PARTICIPATION_EMOJI.to_string())
+fn participation_reaction_type() -> ReactionType {
+    ReactionType::Unicode(PARTICIPATION_EMOJI.to_string())
 }
 
-fn is_participation_reaction(reaction: &serenity::ReactionType) -> bool {
-    matches!(reaction, serenity::ReactionType::Unicode(value) if value == PARTICIPATION_EMOJI)
+fn silent_participation_reaction_type() -> ReactionType {
+    ReactionType::Unicode(SILENT_PARTICIPATION_EMOJI.to_string())
+}
+
+fn is_participation_reaction(reaction: &ReactionType) -> bool {
+    matches!(reaction, ReactionType::Unicode(value) if value == PARTICIPATION_EMOJI)
+}
+
+fn is_silent_participation_reaction(reaction: &ReactionType) -> bool {
+    matches!(reaction, ReactionType::Unicode(value) if value == SILENT_PARTICIPATION_EMOJI)
+}
+
+fn is_supported_participation_reaction(reaction: &ReactionType) -> bool {
+    is_participation_reaction(reaction) || is_silent_participation_reaction(reaction)
 }
 
 fn parse_recruit_config(content: &str) -> Result<RecruitConfig, String> {
@@ -246,10 +252,7 @@ fn extract_toml_block(content: &str) -> Option<&str> {
     Some(rest[..end_index].trim())
 }
 
-async fn send_error_message(
-    ctx: &serenity::Context,
-    reaction: &serenity::Reaction,
-) -> Result<(), Error> {
+async fn send_error_message(ctx: &Context, reaction: &Reaction) -> Result<(), Error> {
     let channel_id = reaction.channel_id;
     let content = reaction
         .user_id
@@ -261,9 +264,9 @@ async fn send_error_message(
 }
 
 async fn send_participation_notification(
-    ctx: &serenity::Context,
+    ctx: &Context,
     config: &RecruitConfig,
-    reaction: &serenity::Reaction,
+    reaction: &Reaction,
 ) -> Result<(), Error> {
     let user_id = match reaction.user_id {
         Some(user_id) => user_id,
@@ -282,17 +285,15 @@ async fn send_participation_notification(
 }
 
 async fn send_start_notification(
-    ctx: &serenity::Context,
+    ctx: &Context,
     config: &RecruitConfig,
-    message: &serenity::Message,
-    role_id: Option<serenity::RoleId>,
-    reaction_type: serenity::ReactionType,
+    message: &Message,
+    role_id: Option<RoleId>,
+    user_ids: HashSet<UserId>,
 ) -> Result<(), Error> {
-    let users = fetch_reaction_users(ctx, message, reaction_type.clone()).await?;
-    let mentions: Vec<String> = users
+    let mentions: Vec<String> = user_ids
         .into_iter()
-        .filter(|user| !user.bot)
-        .map(|user| user.mention().to_string())
+        .map(|user_id| user_id.mention().to_string())
         .collect();
 
     let content = role_id
@@ -309,19 +310,29 @@ async fn send_start_notification(
     schedule_delete_message(ctx.http.clone(), channel_id, start_message.id);
 
     channel_id
-        .delete_reaction_emoji(ctx, message.id, reaction_type)
+        .delete_reaction_emoji(ctx, message.id, participation_reaction_type())
         .await?;
+    if config.notify_on_reaction {
+        channel_id
+            .delete_reaction_emoji(ctx, message.id, silent_participation_reaction_type())
+            .await?;
+    }
     channel_id
         .create_reaction(ctx, message.id, participation_reaction_type())
         .await?;
+    if config.notify_on_reaction {
+        channel_id
+            .create_reaction(ctx, message.id, silent_participation_reaction_type())
+            .await?;
+    }
 
     Ok(())
 }
 
 async fn assign_role_if_missing(
-    ctx: &serenity::Context,
-    reaction: &serenity::Reaction,
-    role_id: serenity::RoleId,
+    ctx: &Context,
+    reaction: &Reaction,
+    role_id: RoleId,
 ) -> Result<(), Error> {
     let Some(user_id) = reaction.user_id else {
         return Ok(());
@@ -337,10 +348,7 @@ async fn assign_role_if_missing(
     Ok(())
 }
 
-async fn send_role_assign_error(
-    ctx: &serenity::Context,
-    reaction: &serenity::Reaction,
-) -> Result<(), Error> {
+async fn send_role_assign_error(ctx: &Context, reaction: &Reaction) -> Result<(), Error> {
     let channel_id = reaction.channel_id;
     const ERROR_MESSAGE: &str = "ロールの付与に失敗しました。権限を確認してください。";
     let content = match reaction.user_id {
@@ -352,21 +360,25 @@ async fn send_role_assign_error(
 }
 
 async fn fetch_reaction_users(
-    ctx: &serenity::Context,
-    message: &serenity::Message,
-    reaction_type: serenity::ReactionType,
-) -> Result<Vec<serenity::User>, Error> {
+    ctx: &Context,
+    message: &Message,
+    reaction_type: ReactionType,
+) -> Result<Vec<UserId>, Error> {
     let mut users = Vec::new();
     let mut after = None;
 
     loop {
         let chunk = message
             .reaction_users(ctx, reaction_type.clone(), Some(100), after)
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|user| !user.bot)
+            .map(|user| user.id)
+            .collect::<Vec<_>>();
         if chunk.is_empty() {
             break;
         }
-        after = chunk.last().map(|user| user.id);
+        after = chunk.last().copied();
         let chunk_len = chunk.len();
         users.extend(chunk);
         if chunk_len < 100 {
@@ -378,9 +390,9 @@ async fn fetch_reaction_users(
 }
 
 fn schedule_delete_message(
-    http: std::sync::Arc<serenity::Http>,
-    channel_id: serenity::ChannelId,
-    message_id: serenity::MessageId,
+    http: std::sync::Arc<Http>,
+    channel_id: ChannelId,
+    message_id: MessageId,
 ) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(DELETE_DELAY_SECONDS)).await;
